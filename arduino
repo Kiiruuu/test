@@ -1,0 +1,627 @@
+#include <DallasTemperature.h>
+#include <LiquidCrystal_I2C.h>
+#include <OneWire.h>
+#include <Wire.h> 
+#include <Adafruit_NeoPixel.h>
+ 
+// Analog
+#define phPin A0
+#define tdsPin A1
+#define turbPin A2
+ 
+// Digital
+#define ONE_WIRE_BUS 2 // temp
+#define ledPin 4 // 1m
+#define moreledPin 6 // 5m
+#define buttonPin 8 // switch
+ 
+#define VREF 5.0              // voltage reference of analag at 1024
+#define SCOUNT  5            // sample point to get average
+
+#define ledCount 60
+#define moreledCount 300
+
+OneWire oneWire(ONE_WIRE_BUS); 
+
+LiquidCrystal_I2C lcd(0x27,20,4);
+
+DallasTemperature sensors(&oneWire);
+
+Adafruit_NeoPixel strip(ledCount, ledPin, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel morestrip(moreledCount, moreledPin, NEO_GRB + NEO_KHZ800);
+ 
+int analogBuffer[SCOUNT];     
+int analogBufferTemp[SCOUNT];
+int analogBufferIndex = 0, copyIndex = 0;
+
+int UPDATES_PER_SECOND = 10;
+int TICKS_TO_SECONDS = 1500 / UPDATES_PER_SECOND;
+
+float averageVoltage = 0, tdsValue = 0, temperature = 25; // current temperature for compensation
+
+float waterTemp;
+
+// pH Level 
+float phVolt, phLevel;
+float phCalibrate = 21.34 - 0.55; // 0.4 - 0.43 direct, 0.55 breadboard
+unsigned long int avgval;
+int buffer_arr[10], temp;
+
+// turbidity
+int turbidity;
+
+//button
+int buttonState = HIGH;
+int lastButtonState = HIGH;
+int waterMode = 0; // 0 for aquarium, 1 for drinking
+
+// LED status code
+int phStatus = 0, tempStatus = 0, tdsStatus = 0, turbStatus = 0;
+int ledBrightness = 128;
+int moreledBrightness = 60;
+
+uint32_t orange = strip.Color(255, 165, 0);
+uint32_t orng = morestrip.Color(255, 165, 0);
+uint32_t red = strip.Color(255, 0, 0);
+uint32_t rd = morestrip.Color(255, 0, 0);
+uint32_t yellow = strip.Color(255, 255, 0);
+uint32_t yllw = morestrip.Color(255, 255, 0);
+uint32_t green = strip.Color(0, 255, 0);
+uint32_t grn = morestrip.Color(0, 255, 0);
+
+
+ 
+// median filtering algorithm
+int getMedianNum(int bArray[], int iFilterLen){
+  int bTab[iFilterLen];
+  for (byte i = 0; i<iFilterLen; i++)
+  bTab[i] = bArray[i];
+  int i, j, bTemp;
+  for (j = 0; j < iFilterLen - 1; j++) {
+    for (i = 0; i < iFilterLen - j - 1; i++) {
+      if (bTab[i] > bTab[i + 1]) {
+        bTemp = bTab[i];
+        bTab[i] = bTab[i + 1];
+        bTab[i + 1] = bTemp;
+      }
+    }
+  }
+  if ((iFilterLen & 1) > 0){
+    bTemp = bTab[(iFilterLen - 1) / 2];
+  }
+  else {
+    bTemp = (bTab[iFilterLen / 2] + bTab[iFilterLen / 2 - 1]) / 2;
+  }
+  return bTemp;
+}
+ 
+void setup() {
+  Serial.begin(9600);
+  sensors.begin();
+  strip.begin();
+  morestrip.begin();
+  strip.setBrightness(ledBrightness);  
+  morestrip.setBrightness(moreledBrightness);  
+  pinMode(tdsPin,INPUT);
+  pinMode(phPin, INPUT);
+  pinMode(turbPin, INPUT);
+  pinMode(buttonPin, INPUT);
+  pinMode(ledPin, OUTPUT);
+  pinMode(moreledPin, OUTPUT);
+  for(int i=0; i < ledCount; i++) { 
+    strip.setPixelColor(i, orange);
+    strip.show();
+    delay(50);
+  }
+  // LCD 
+  lcd.init(); 
+  lcd.begin(20, 4);
+  lcd.backlight();
+  lcd.setCursor(4, 0);
+    lcd.print("Water Quality");
+  lcd.setCursor(5, 1);
+    lcd.print("Monitoring");     
+  lcd.setCursor(9, 2);
+    lcd.print("By");
+  lcd.setCursor(5, 3);
+    lcd.print("HydroSense");
+  delay(1000);
+  for(int i=60; i >= 0; i--) { 
+    strip.setPixelColor(i, strip.Color(255, 255, 255));
+    strip.show();
+    delay(20);
+  }
+}
+ 
+void loop() {
+  buttonState = digitalRead(buttonPin);
+  if (buttonState != lastButtonState) {
+    if (buttonState == LOW) {
+      waterMode = 1 - waterMode;
+    }
+    delay(50);
+  }
+  lastButtonState = buttonState;
+  getPH();
+  getTDS();
+  getTurb();
+  getTemp();
+  lcd.clear();
+  for(int i=0; i < UPDATES_PER_SECOND; i++) {
+    // TDS 
+    static unsigned long analogSampleTimepoint = millis();
+    if(millis()-analogSampleTimepoint > 40U) {     //every 40 milliseconds,read the analog value from the ADC
+      analogSampleTimepoint = millis();
+      analogBuffer[analogBufferIndex] = analogRead(tdsPin);    //read the analog value and store into the buffer
+      analogBufferIndex++;
+      if(analogBufferIndex == SCOUNT) { 
+        analogBufferIndex = 0;
+      }
+    }   
+  
+    static unsigned long printTimepoint = millis();
+    if(millis()-printTimepoint > 800U) {
+      printTimepoint = millis();
+      for(copyIndex=0; copyIndex<SCOUNT; copyIndex++) {
+        analogBufferTemp[copyIndex] = analogBuffer[copyIndex];
+      
+        // read the analog value more stable by the median filtering algorithm, and convert to voltage value
+        averageVoltage = getMedianNum(analogBufferTemp,SCOUNT) * (float)VREF / 1024.0;
+      
+        //temperature compensation formula: fFinalResult(25^C) = fFinalResult(current)/(1.0+0.02*(fTP-25.0)); 
+        temperature = sensors.getTempCByIndex(0);
+        float compensationCoefficient = 1.0+0.02*(temperature-28.0);
+        //temperature compensation
+        float compensationVoltage=averageVoltage/compensationCoefficient;
+      
+        //convert voltage value to tds value
+        tdsValue=(133.42*compensationVoltage*compensationVoltage*compensationVoltage - 255.86*compensationVoltage*compensationVoltage + 857.39*compensationVoltage)*0.5;
+      }
+    }
+    // temp
+    sensors.requestTemperatures();
+    waterTemp = sensors.getTempCByIndex(0);
+    // ph
+    for (int i = 0; i < 10; i++) {
+    buffer_arr[i] = analogRead(phPin);
+    delay(10);
+    }
+    for (int i = 0; i < 10; i++) {
+      buffer_arr[i] = analogRead(phPin);
+      delay(10);
+    }
+    for (int i = 0; i < 9; i++) {
+      for (int j = i + 1; j < 10; j++) {
+        if (buffer_arr[i] > buffer_arr[j]) {
+          temp = buffer_arr[i];
+          buffer_arr[i] = buffer_arr[j];
+          buffer_arr[j] = temp;
+        }
+      }
+    }
+    avgval = 0;
+    for (int i = 2; i < 8; i++)
+    avgval += buffer_arr[i];
+    phVolt = (float)avgval * 5.0 / 1023 / 6;
+    phLevel = -5.70 * phVolt + phCalibrate;
+    // turbidity
+    int turbRaw = analogRead(turbPin);
+    turbidity = map(turbRaw, 0,640, 100, 0);
+    // LCD
+    lcd.setCursor(1, 0);
+    lcd.print("pH  : ");
+    lcd.print(phLevel);
+    lcd.setCursor(14, 0);
+    if (waterMode == 0) { // HELLO
+    if (phLevel >= 6.7 && phLevel <= 7.8) {
+      lcd.print(" Good ");
+    } else if ((phLevel  >= 6.5 && phLevel  < 6.7) || (phLevel  > 7.8 && phLevel  < 8.5)) {
+      lcd.print("Alert ");
+    } else {
+      lcd.print(" Bad ");
+    }
+    } else {
+      if (phLevel >= 6.5 && phLevel <= 9.5) {
+        lcd.print(" Safe ");
+      } else if ((phLevel  >= 6 && phLevel  < 6.5) || (phLevel  > 9.5 && phLevel  < 9.8)) {
+        lcd.print("Alert ");
+      } else {
+      lcd.print(" Bad ");
+      }
+    }
+    lcd.setCursor(1, 1);
+    lcd.print("TDS : ");
+    lcd.print(round(tdsValue));
+    lcd.setCursor(14, 1);
+    if (waterMode == 0) { // HELLO
+    if (tdsValue >= 100 && tdsValue <= 500) {
+      lcd.print(" Good ");
+    } else if ((tdsValue >= 50 && tdsValue < 100) || (tdsValue > 500 && tdsValue < 600)) {
+      lcd.print("Alert ");
+    } else {
+      lcd.print(" Bad ");
+    }
+    } else {
+      if (tdsValue <= 400) {
+      lcd.print(" Safe ");
+    } else if (tdsValue > 400 && tdsValue < 500) {
+      lcd.print("Alert ");
+    } else {
+      lcd.print(" Bad ");
+    } 
+    }
+    lcd.setCursor(1, 2);
+    lcd.print("Turb: ");
+    lcd.print(turbidity);
+    lcd.setCursor(14, 2);
+    if (waterMode == 0) { // HELLO
+    if (turbidity < 20) {
+      lcd.print(" Clean ");
+    } else if ((turbidity > 20) && (turbidity < 50)) {
+      lcd.print("Cloudy ");
+    } else {
+      lcd.print(" Dirty ");
+    }
+    } else {
+    if (turbidity < 20) {
+      lcd.print(" Safe ");
+    } else {
+      lcd.print(" Dirty ");
+    }
+    }
+    lcd.setCursor(1, 3);
+    lcd.print("Temp: ");
+    lcd.print(round(waterTemp));
+    lcd.print((char)223);
+    lcd.print("C");
+    lcd.setCursor(14, 3);
+    if (waterMode == 0) { // HELlO 
+    if (waterTemp >= 23 && waterTemp <= 29) {
+      lcd.print(" Safe ");
+    } else if ((waterTemp >= 21 && waterTemp < 23) || (waterTemp > 29 && waterTemp <= 31)) {
+      lcd.print("Alert ");
+    } else {
+      lcd.print(" Bad ");
+    }
+    } else {
+    if (waterTemp >= 5 && waterTemp <= 50) {
+      lcd.print(" Safe ");
+    } else if ((waterTemp >= 0 && waterTemp < 5) || (waterTemp > 50 && waterTemp <= 55)) {
+      lcd.print("Alert ");
+    } else {
+      lcd.print(" Bad ");
+    }
+    }
+    updateLED();
+    updatemoreLED();
+    delay(TICKS_TO_SECONDS);
+  }
+}
+
+void getTDS() {
+  if (waterMode == 0) {
+    if (tdsValue >= 100 && tdsValue <= 500) {
+      tdsStatus = 1;
+    } else if ((tdsValue >= 50 && tdsValue < 100) || (tdsValue > 500 && tdsValue < 600)) {
+      tdsStatus = 2;
+    } else {
+      tdsStatus = 3;
+    }
+  } else {
+    if (tdsValue <= 400) {
+      tdsStatus = 1;
+    } else if (tdsValue > 400 && tdsValue <= 500) {
+      tdsStatus = 2;
+    } else {
+      tdsStatus = 3;
+    }
+  }
+}
+
+// pH Sensor
+void getPH() {
+  if (waterMode == 0) {
+    if (phLevel >= 6.7 && phLevel <= 7.8) {
+      phStatus = 1;
+    } else if ((phLevel  >= 6.5 && phLevel  < 6.7) || (phLevel  > 7.8 && phLevel  < 8.5)) {
+      phStatus = 2;
+    } else {
+      phStatus = 3;
+    }
+  } else {
+    if (phLevel >= 6.5 && phLevel <= 9.5) {
+      phStatus = 1;
+    } else if ((phLevel  >= 6 && phLevel  < 6.5) || (phLevel  > 9.5 && phLevel  < 9.8)) {
+      phStatus = 2;
+    } else {
+      phStatus = 3;
+    }
+  }
+}
+
+void updateLED() {
+  switch(phStatus) {
+    case 1:
+      for(int i=0; i < 15; i++) { 
+        strip.setPixelColor(i, green);
+        strip.show();
+        delay(10);
+      }
+      break;
+    case 2:
+      for(int i=0; i < 15; i++) { 
+        strip.setPixelColor(i, yellow);
+        strip.show();
+        delay(10);
+      }
+      break;  
+    case 3:
+      for(int i=0; i < 15; i++) { 
+        strip.setPixelColor(i, red);
+        strip.show();
+        delay(10);
+      }  
+      break;
+    default:
+      for(int i=0; i < 15; i++) { 
+        strip.setPixelColor(i, orange);
+        strip.show();
+        delay(10);
+      }   
+      break;
+  }
+  switch(tdsStatus) {
+    case 1:
+      for(int i=15; i < 30; i++) { 
+        strip.setPixelColor(i, green);
+        strip.show();
+        delay(10);
+      }
+      break;
+    case 2:
+      for(int i=15; i < 30; i++) { 
+        strip.setPixelColor(i, yellow);
+        strip.show();
+        delay(10);
+      }
+      break;  
+    case 3:
+      for(int i=15; i < 30; i++) { 
+        strip.setPixelColor(i, red);
+        strip.show();
+        delay(10);
+      }  
+      break;
+    default:
+      for(int i=15; i < 30; i++) { 
+        strip.setPixelColor(i, orange);
+        strip.show();
+        delay(10);
+      }   
+      break;
+  }
+  switch(turbStatus) {
+    case 1:
+      for(int i=30; i < 45; i++) { 
+        strip.setPixelColor(i, green);
+        strip.show();
+        delay(10);
+      }
+      break;
+    case 2:
+      for(int i=30; i < 45; i++) { 
+        strip.setPixelColor(i, yellow);
+        strip.show();
+        delay(10);
+      }
+      break;  
+    case 3:
+      for(int i=30; i < 45; i++) { 
+        strip.setPixelColor(i, red);
+        strip.show();
+        delay(10);
+      }  
+      break;
+    default:
+      for(int i=30; i < 45; i++) { 
+        strip.setPixelColor(i, orange);
+        strip.show();
+        delay(10);
+      }   
+      break;
+  }
+  switch(tempStatus) {
+    case 1:
+      for(int i=45; i < 60; i++) { 
+        strip.setPixelColor(i, green);
+        strip.show();
+        delay(10);
+      }
+      break;
+    case 2:
+      for(int i=45; i < 60; i++) { 
+        strip.setPixelColor(i, yellow);
+        strip.show();
+        delay(10);
+      }
+      break;  
+    case 3:
+      for(int i=45; i < 60; i++) { 
+        strip.setPixelColor(i, red);
+        strip.show();
+        delay(10);
+      }  
+      break;
+    default:
+      for(int i=45; i < 60; i++) { 
+        strip.setPixelColor(i, orange);
+        strip.show();
+        delay(10);
+      }   
+      break;
+  }
+}
+
+void updatemoreLED() {
+  switch(phStatus) {
+    case 1:
+      for(int i=0; i < 75; i++) { 
+        morestrip.setPixelColor(i, grn);
+        morestrip.show();
+        delay(10);
+      }
+      break;
+    case 2:
+      for(int i=0; i < 75; i++) { 
+        morestrip.setPixelColor(i, grn);
+        morestrip.show();
+        delay(10);
+      }
+      break;  
+    case 3:
+      for(int i=0; i < 75; i++) { 
+        morestrip.setPixelColor(i, rd);
+        morestrip.show();
+        delay(10);
+      }  
+      break;
+    default:
+      for(int i=0; i < 75; i++) { 
+        morestrip.setPixelColor(i, orng);
+        morestrip.show();
+        delay(10);
+      }   
+      break;
+  }
+  switch(tdsStatus) {
+    case 1:
+      for(int i=75; i < 150; i++) { 
+        morestrip.setPixelColor(i, grn);
+        morestrip.show();
+        delay(10);
+      }
+      break;
+    case 2:
+      for(int i=75; i < 150; i++) { 
+        morestrip.setPixelColor(i, grn);
+        morestrip.show();
+        delay(10);
+      }
+      break;  
+    case 3:
+      for(int i=75; i < 150; i++) { 
+        morestrip.setPixelColor(i, rd);
+        morestrip.show();
+        delay(10);
+      }  
+      break;
+    default:
+      for(int i=75; i < 150; i++) { 
+        morestrip.setPixelColor(i, orng);
+        morestrip.show();
+        delay(10);
+      }   
+      break;
+  }
+  switch(turbStatus) {
+    case 1:
+      for(int i=150; i < 225; i++) { 
+        morestrip.setPixelColor(i, grn);
+        morestrip.show();
+        delay(10);
+      }
+      break;
+    case 2:
+      for(int i=150; i < 225; i++) { 
+        morestrip.setPixelColor(i, grn);
+        morestrip.show();
+        delay(10);
+      }
+      break;  
+    case 3:
+      for(int i=150; i < 225; i++) { 
+        morestrip.setPixelColor(i, rd);
+        morestrip.show();
+        delay(10);
+      }  
+      break;
+    default:
+      for(int i=150; i < 225; i++) { 
+        morestrip.setPixelColor(i, orng);
+        morestrip.show();
+        delay(10);
+      }   
+      break;
+  }
+  switch(tempStatus) {
+    case 1:
+      for(int i=225; i < 300; i++) { 
+        morestrip.setPixelColor(i, grn);
+        morestrip.show();
+        delay(10);
+      }
+      break;
+    case 2:
+      for(int i=225; i < 300; i++) { 
+        morestrip.setPixelColor(i, grn);
+        morestrip.show();
+        delay(10);
+      }
+      break;  
+    case 3:
+      for(int i=225; i < 300; i++) { 
+        morestrip.setPixelColor(i, rd);
+        morestrip.show();
+        delay(10);
+      }  
+      break;
+    default:
+      for(int i=225; i < 300; i++) { 
+        morestrip.setPixelColor(i, orng);
+        morestrip.show();
+        delay(10);
+      }   
+      break;
+  }
+}
+
+
+// DS18B20
+void getTemp() {
+  if (waterMode == 0) {
+    if (waterTemp >= 23 && waterTemp <= 29) {
+      tempStatus = 1;
+    } else if ((waterTemp >= 21 && waterTemp < 23) || (waterTemp > 29 && waterTemp <= 31)) {
+      tempStatus = 2;
+    } else {
+      tempStatus = 3;
+    }
+  } else {
+    if (waterTemp >= 5 && waterTemp <= 50) {
+      tempStatus = 1;
+    } else if ((waterTemp >= 0 && waterTemp < 5) || (waterTemp > 50 && waterTemp <= 55)) {
+      tempStatus = 2;
+    } else {
+      tempStatus = 3;
+    }
+  }
+}
+
+// Turbidity
+void getTurb() {
+  if (waterMode == 0) {
+    if (turbidity < 20) {
+      turbStatus = 1;
+    } else if ((turbidity > 20) && (turbidity < 50)) {
+      turbStatus = 2;
+    } else {
+      turbStatus = 3;
+    }
+  } else {
+    if (turbidity < 20) {
+      turbStatus = 1;
+    } else {
+      turbStatus = 3;
+    }
+  }
+}
